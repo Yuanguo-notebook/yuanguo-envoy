@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package envoy.extensions.filters.network.postgres_proxy.v3alpha;
 
+import "envoy/config/rbac/v3/rbac.proto";
+
 import "google/protobuf/wrappers.proto";
 
 import "envoy/annotations/deprecation.proto";
@@ -20,7 +22,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // <config_network_filters_postgres_proxy>`.
 // [#extension: envoy.filters.network.postgres_proxy]
 
-// [#next-free-field: 6]
+// [#next-free-field: 7]
 message PostgresProxy {
   // Downstream and Upstream SSL operational modes.
   enum SSLMode {
@@ -80,4 +82,16 @@ message PostgresProxy {
   // :ref:`starttls transport socket <envoy_v3_api_msg_extensions.transport_sockets.starttls.v3.UpstreamStartTlsConfig>`.
   // Defaults to ``DISABLE``.
   SSLMode downstream_ssl = 5;
+
+  // Connection authorization evaluated once after decoding the startup message, before forwarding
+  // it upstream. If absent, authorization is disabled. If set but empty, all connections are denied.
+  // Uses the common RBAC ALLOW, DENY and LOG semantics, not ordered PostgreSQL host-based authentication rules.
+  // Startup user and database are exposed as dynamic metadata under ``envoy.filters.network.postgres_proxy``
+  // in the ``startup.user`` and ``startup.database`` fields, independently of SQL parsing.
+  // The boolean ``startup.ssl`` indicates downstream TLS.
+  // Peer certificate principals require downstream TLS termination and appropriate client certificate
+  // validation. Encrypted passthrough is rejected when rules are configured.
+  // Only ordinary protocol 3.0 startup messages are supported with rules enabled; malformed messages,
+  // cancellation, replication and GSS encryption requests are rejected.
+  config.rbac.v3.RBAC rules = 6;
 }

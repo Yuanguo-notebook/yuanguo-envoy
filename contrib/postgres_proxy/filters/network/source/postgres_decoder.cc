@@ -184,6 +184,9 @@ void DecoderImpl::initialize() {
 */
 Decoder::Result DecoderImpl::onData(Buffer::Instance& data, bool frontend) {
   switch (state_) {
+  case State::RejectedState:
+    data.drain(data.length());
+    return Result::Stopped;
   case State::InitState:
     return onDataInit(data, frontend);
   case State::OutOfSyncState:
@@ -221,6 +224,33 @@ Decoder::Result DecoderImpl::onDataInit(Buffer::Instance& data, bool) {
   const auto msgParser = f();
   // Run the validation.
   message_len_ = data.peekBEInt<uint32_t>(0);
+  if (callbacks_->authorizationEnabled()) {
+    if (message_len_ < Postgres::Protocol::STARTUP_HEADER_SIZE ||
+        message_len_ > Postgres::Protocol::MAX_STARTUP_PACKET_LENGTH) {
+      callbacks_->rejectStartup();
+      state_ = State::RejectedState;
+      data.drain(data.length());
+      return Result::Stopped;
+    }
+    if (data.length() < message_len_) {
+      return Result::Stopped;
+    }
+    const uint32_t code = data.peekBEInt<uint32_t>(4);
+    const bool ssl_request = code == Postgres::Protocol::SSL_REQUEST_CODE;
+    if ((ssl_request && (message_len_ != Postgres::Protocol::SSL_REQUEST_MESSAGE_SIZE ||
+                         data.length() != message_len_)) ||
+        (!ssl_request && !parseStartupForAuthorization(data))) {
+      callbacks_->rejectStartup();
+      state_ = State::RejectedState;
+      data.drain(data.length());
+      return Result::Stopped;
+    }
+    if (!ssl_request && !callbacks_->authorizeStartup()) {
+      state_ = State::RejectedState;
+      data.drain(data.length());
+      return Result::Stopped;
+    }
+  }
   if (message_len_ > Postgres::Protocol::MAX_STARTUP_PACKET_LENGTH) {
     // Message does not conform to the expected format. Move to out-of-sync state.
     data.drain(data.length());
@@ -291,7 +321,7 @@ Decoder::Result DecoderImpl::onDataInit(Buffer::Instance& data, bool) {
   data.drain(4);
 
   processMessageBody(data, FRONTEND, message_len_ - 4, first_, msgParser);
-  data.drain(message_len_);
+  // processMessageBody already consumed the body; preserve any following messages.
   return result;
 }
 
@@ -550,7 +580,43 @@ void DecoderImpl::onQuery() { callbacks_->processQuery(message_); }
 // Method is invoked on clear-text Startup message.
 // The message format is continuous string of the following format:
 // user<username>database<database-name>application_name<application>encoding<encoding-type>
+bool DecoderImpl::parseStartupForAuthorization(const Buffer::Instance& data) {
+  if (data.peekBEInt<uint32_t>(4) != Postgres::Protocol::POSTGRES_PROTOCOL_VERSION_30) {
+    return false;
+  }
+  std::string body(message_len_ - 8, '\0');
+  data.copyOut(8, body.size(), body.data());
+  attributes_.clear();
+  size_t offset = 0;
+  while (offset < body.size() && body[offset] != '\0') {
+    const size_t key_end = body.find('\0', offset);
+    if (key_end == std::string::npos) {
+      return false;
+    }
+    const size_t value_end = body.find('\0', key_end + 1);
+    if (value_end == std::string::npos ||
+        !attributes_
+             .emplace(body.substr(offset, key_end - offset),
+                      body.substr(key_end + 1, value_end - key_end - 1))
+             .second) {
+      return false;
+    }
+    offset = value_end + 1;
+  }
+  if (offset + 1 != body.size() || !attributes_.contains("user") ||
+      attributes_.at("user").empty() || attributes_.contains("replication")) {
+    return false;
+  }
+  if (!attributes_.contains("database") || attributes_.at("database").empty()) {
+    attributes_["database"] = attributes_.at("user");
+  }
+  return true;
+}
+
 void DecoderImpl::onStartup() {
+  if (callbacks_->authorizationEnabled()) {
+    return;
+  }
   // First 4 bytes of startup message contains version code.
   // It is skipped. After that message contains attributes.
   attributes_ = absl::StrSplit(message_.substr(4), absl::ByChar('\0'), absl::SkipEmpty());

@@ -51,6 +51,74 @@ example below:
           cluster: postgres_cluster
 
 
+Connection authorization
+------------------------
+
+The optional ``rules`` field uses Envoy's common RBAC policy format. Rules are evaluated once,
+when a complete startup message is available, before forwarding startup data or negotiating
+upstream TLS. Absent rules preserve existing behavior; ``rules: {}`` denies every connection.
+``ALLOW`` permits matching policies, ``DENY`` rejects matching policies, and ``LOG`` records an
+access log hint without denying connections. Policies do not implement ordered PostgreSQL HBA rules.
+
+For example, the following filter permits the application user to access the billing database:
+
+.. code-block:: yaml
+
+    name: envoy.filters.network.postgres_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.postgres_proxy.v3alpha.PostgresProxy
+      stat_prefix: postgres
+      enable_sql_parsing: false
+      rules:
+        action: ALLOW
+        policies:
+          billing:
+            principals:
+            - any: true
+            permissions:
+            - and_rules:
+                rules:
+                - sourced_metadata:
+                    metadata_matcher:
+                      filter: envoy.filters.network.postgres_proxy
+                      path: [{key: startup}, {key: user}]
+                      value: {string_match: {exact: app}}
+                - sourced_metadata:
+                    metadata_matcher:
+                      filter: envoy.filters.network.postgres_proxy
+                      path: [{key: startup}, {key: database}]
+                      value: {string_match: {exact: billing}}
+
+The filter publishes ``startup.user``, ``startup.database``, and the boolean ``startup.ssl``
+in dynamic metadata under ``envoy.filters.network.postgres_proxy``, even with SQL parsing disabled.
+An omitted or empty database defaults to the startup username. The username is supplied by the client;
+PostgreSQL still authenticates it. The decision is recorded in ``authorization.result`` and
+``authorization.policy``. Later SQL metadata is merged without removing these connection fields.
+
+Use RBAC IP principals to restrict client addresses. To match client URI SANs, DNS SANs, or
+certificate subjects, use ``authenticated.principal_name``, terminate downstream TLS with
+``downstream_ssl: ALLOW`` or ``REQUIRE`` and the STARTTLS transport socket, and configure trusted
+client certificate validation. Require a client certificate when certificate identity is mandatory.
+A bare ``authenticated: {}`` is not a substitute for requiring and validating client certificates.
+HTTP header, path and route metadata matchers are rejected during configuration.
+
+With rules enabled, encrypted passthrough, GSSAPI negotiation, cancellation, replication, unsupported
+protocol versions, and malformed startup messages are rejected. Clients should disable GSSAPI
+negotiation and use ordinary protocol 3.0 startup messages. Rejections receive a PostgreSQL
+``FATAL`` error with SQLSTATE ``28000`` before the connection is closed.
+
+The TCP proxy normally connects upstream immediately. To defer that connection until the Postgres
+filter releases authorized data, configure the following fields on the TCP proxy:
+
+.. code-block:: yaml
+
+    upstream_connect_mode: ON_DOWNSTREAM_DATA
+    max_early_data_bytes: 16384
+
+For new connections, listener configuration updates can replace the rules. Existing authorized
+sessions are not re-evaluated.
+
+
 .. _config_network_filters_postgres_proxy_stats:
 
 Statistics
@@ -62,6 +130,8 @@ Every configured Postgres proxy filter has statistics rooted at postgres.<stat_p
   :header: Name, Type, Description
   :widths: 2, 1, 2
 
+  authorization_allowed, Counter, Number of startup authorization decisions allowing a connection
+  authorization_denied, Counter, Number of connections rejected by startup authorization or validation
   errors, Counter, Number of times the server replied with ERROR message
   errors_error, Counter, Number of times the server replied with ERROR message with ERROR severity
   errors_fatal, Counter, Number of times the server replied with ERROR message with FATAL severity

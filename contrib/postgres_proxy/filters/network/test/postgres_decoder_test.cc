@@ -27,6 +27,9 @@ public:
   MOCK_METHOD(void, incNotices, (NoticeType), (override));
   MOCK_METHOD(void, incErrors, (ErrorType), (override));
   MOCK_METHOD(void, processQuery, (const std::string&), (override));
+  MOCK_METHOD(bool, authorizationEnabled, (), (const, override));
+  MOCK_METHOD(bool, authorizeStartup, (), (override));
+  MOCK_METHOD(void, rejectStartup, (), (override));
   MOCK_METHOD(bool, onSSLRequest, (), (override));
   MOCK_METHOD(bool, shouldEncryptUpstream, (), (const));
   MOCK_METHOD(void, sendUpstream, (Buffer::Instance&));
@@ -122,6 +125,41 @@ TEST_F(PostgresProxyDecoderTest, StartupMessage) {
   ASSERT_THAT(decoder_->getAttributes().at("database"), "testdb");
   // This attribute should not be found
   ASSERT_THAT(decoder_->getAttributes().find("no"), decoder_->getAttributes().end());
+}
+
+TEST_F(PostgresProxyDecoderTest, AuthorizesBeforeNegotiatingUpstreamTls) {
+  decoder_->state(DecoderImpl::State::InitState);
+  ON_CALL(callbacks_, authorizationEnabled()).WillByDefault(testing::Return(true));
+  const std::string attributes = "user\0app\0\0"s;
+  data_.writeBEInt<uint32_t>(8 + attributes.size());
+  data_.writeBEInt<uint32_t>(Postgres::Protocol::POSTGRES_PROTOCOL_VERSION_30);
+  data_.add(attributes);
+  testing::InSequence sequence;
+  EXPECT_CALL(callbacks_, authorizeStartup()).WillOnce(testing::Invoke([this]() {
+    EXPECT_EQ("app", decoder_->getAttributes().at("user"));
+    EXPECT_EQ("app", decoder_->getAttributes().at("database"));
+    return true;
+  }));
+  EXPECT_CALL(callbacks_, shouldEncryptUpstream()).WillOnce(testing::Return(true));
+  EXPECT_CALL(callbacks_, sendUpstream(testing::_));
+  EXPECT_EQ(Decoder::Result::Stopped, decoder_->onData(data_, true));
+  EXPECT_EQ(DecoderImpl::State::NegotiatingUpstreamSSL, decoder_->state());
+}
+
+TEST_F(PostgresProxyDecoderTest, RejectedStartupCannotResumeDecoding) {
+  decoder_->state(DecoderImpl::State::InitState);
+  ON_CALL(callbacks_, authorizationEnabled()).WillByDefault(testing::Return(true));
+  const std::string attributes = "user\0app\0\0"s;
+  data_.writeBEInt<uint32_t>(8 + attributes.size());
+  data_.writeBEInt<uint32_t>(Postgres::Protocol::POSTGRES_PROTOCOL_VERSION_30);
+  data_.add(attributes);
+  EXPECT_CALL(callbacks_, authorizeStartup()).WillOnce(testing::Return(false));
+  EXPECT_CALL(callbacks_, shouldEncryptUpstream()).Times(0);
+  EXPECT_EQ(Decoder::Result::Stopped, decoder_->onData(data_, true));
+  EXPECT_EQ(DecoderImpl::State::RejectedState, decoder_->state());
+  data_.add("more data");
+  EXPECT_EQ(Decoder::Result::Stopped, decoder_->onData(data_, true));
+  EXPECT_EQ(0, data_.length());
 }
 
 // Test verifies that when Startup message does not carry

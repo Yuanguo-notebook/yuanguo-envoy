@@ -44,6 +44,10 @@ public:
 
   virtual void processQuery(const std::string&) PURE;
 
+  virtual bool authorizationEnabled() const PURE;
+  // Attributes are available before this callback, and no startup bytes have been forwarded.
+  virtual bool authorizeStartup() PURE;
+  virtual void rejectStartup() PURE;
   virtual bool onSSLRequest() PURE;
   virtual bool shouldEncryptUpstream() const PURE;
   virtual void sendUpstream(Buffer::Instance&) PURE;
@@ -101,7 +105,8 @@ public:
     InSyncState,
     OutOfSyncState,
     EncryptedState,
-    NegotiatingUpstreamSSL
+    NegotiatingUpstreamSSL,
+    RejectedState
   };
   State state() const { return state_; }
   void state(State state) { state_ = state; }
@@ -167,6 +172,7 @@ protected:
   void onQuery();
   void onParse();
   void onStartup();
+  bool parseStartupForAuthorization(const Buffer::Instance& data);
 
   void incMessagesUnknown() { callbacks_->incMessagesUnknown(); }
   void incSessionsEncrypted() { callbacks_->incSessionsEncrypted(); }

@@ -7,6 +7,7 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/logger.h"
+#include "source/extensions/filters/common/rbac/engine.h"
 
 #include "contrib/envoy/extensions/filters/network/postgres_proxy/v3alpha/postgres_proxy.pb.h"
 #include "contrib/postgres_proxy/filters/network/source/postgres_decoder.h"
@@ -21,6 +22,8 @@ namespace PostgresProxy {
  * All Postgres proxy stats. @see stats_macros.h
  */
 #define ALL_POSTGRES_PROXY_STATS(COUNTER)                                                          \
+  COUNTER(authorization_allowed)                                                                   \
+  COUNTER(authorization_denied)                                                                    \
   COUNTER(errors)                                                                                  \
   COUNTER(errors_error)                                                                            \
   COUNTER(errors_fatal)                                                                            \
@@ -88,6 +91,7 @@ public:
           envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE};
   Stats::Scope& scope_;
   PostgresProxyStats stats_;
+  std::unique_ptr<Filters::Common::RBAC::RoleBasedAccessControlEngine> rules_;
 
 private:
   PostgresProxyStats generateStats(const std::string& prefix, Stats::Scope& scope) {
@@ -114,6 +118,9 @@ public:
   Network::FilterStatus onWrite(Buffer::Instance& data, bool end_stream) override;
 
   // PostgresProxy::DecoderCallback
+  bool authorizationEnabled() const override { return config_->rules_ != nullptr; }
+  bool authorizeStartup() override;
+  void rejectStartup() override;
   void incErrors(ErrorType) override;
   void incMessagesBackend() override;
   void incMessagesFrontend() override;
@@ -159,7 +166,10 @@ private:
   Buffer::OwnedImpl backend_buffer_;
   std::unique_ptr<Decoder> decoder_;
   std::unique_ptr<Encoder> encoder_;
-  bool switched_to_tls_{false}; // tells if tls negotiation with downstream client is completed
+  Buffer::OwnedImpl pending_startup_;
+  bool authorization_checked_{false};
+  bool authorization_denied_{false};
+  bool switched_to_tls_{false}; // whether the downstream transport has switched to TLS
 };
 
 } // namespace PostgresProxy

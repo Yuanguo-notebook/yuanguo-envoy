@@ -30,13 +30,38 @@ PostgresFilter::PostgresFilter(PostgresFilterConfigSharedPtr config) : config_{c
 }
 
 // Network::ReadFilter
-Network::FilterStatus PostgresFilter::onData(Buffer::Instance& data, bool) {
+Network::FilterStatus PostgresFilter::onData(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(trace, "postgres_proxy: got {} bytes", read_callbacks_->connection(),
                  data.length());
 
-  // Frontend Buffer
+  if (authorization_denied_) {
+    data.drain(data.length());
+    return Network::FilterStatus::StopIteration;
+  }
+  // Preserve the complete initial packet until authorization has finished. The decoder consumes
+  // its own copy; forwarding only the final fragment would corrupt the upstream startup message.
+  const bool pending_authorization = authorizationEnabled() && !authorization_checked_;
   frontend_buffer_.add(data);
+  if (pending_authorization) {
+    pending_startup_.move(data);
+  }
   Network::FilterStatus result = doDecode(frontend_buffer_, true);
+  if (pending_authorization && !authorization_checked_ && end_stream) {
+    rejectStartup();
+  }
+  if (authorization_denied_) {
+    result = Network::FilterStatus::StopIteration;
+    frontend_buffer_.drain(frontend_buffer_.length());
+  }
+  if (pending_authorization) {
+    if (result == Network::FilterStatus::Continue) {
+      data.move(pending_startup_);
+    } else if (frontend_buffer_.length() == 0 || authorization_checked_) {
+      // SSLRequest was consumed locally, or the decoder owns the startup packet while
+      // negotiating upstream TLS. Neither packet may also be forwarded here.
+      pending_startup_.drain(pending_startup_.length());
+    }
+  }
   if (result == Network::FilterStatus::StopIteration) {
     data.drain(data.length());
   }
@@ -205,6 +230,14 @@ void PostgresFilter::processQuery(const std::string& sql) {
 }
 
 bool PostgresFilter::onSSLRequest() {
+  if (authorizationEnabled() &&
+      (switched_to_tls_ ||
+       (!config_->terminate_ssl_ && config_->downstream_ssl_ ==
+                                        envoy::extensions::filters::network::postgres_proxy::
+                                            v3alpha::PostgresProxy::DISABLE))) {
+    rejectStartup();
+    return false;
+  }
   if (config_->downstream_ssl_ ==
           envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE &&
       !config_->terminate_ssl_) {
@@ -287,6 +320,52 @@ bool PostgresFilter::encryptUpstream(bool upstream_agreed, Buffer::Instance& dat
   }
 
   return encrypted;
+}
+
+bool PostgresFilter::authorizeStartup() {
+  authorization_checked_ = true;
+  if (config_->downstream_ssl_ ==
+          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::REQUIRE &&
+      !switched_to_tls_) {
+    rejectStartup();
+    return false;
+  }
+  Protobuf::Struct metadata;
+  auto& startup = *(*metadata.mutable_fields())["startup"].mutable_struct_value()->mutable_fields();
+  const auto& attributes = decoder_->getAttributes();
+  startup["user"].set_string_value(attributes.at("user"));
+  startup["database"].set_string_value(attributes.at("database"));
+  startup["ssl"].set_bool_value(read_callbacks_->connection().ssl() != nullptr);
+  auto& info = read_callbacks_->connection().streamInfo();
+  info.setDynamicMetadata(NetworkFilterNames::get().PostgresProxy, metadata);
+  std::string policy;
+  const bool allowed = config_->rules_->handleAction(read_callbacks_->connection(), info, &policy);
+  Protobuf::Struct decision;
+  auto& fields =
+      *(*decision.mutable_fields())["authorization"].mutable_struct_value()->mutable_fields();
+  fields["policy"].set_string_value(policy);
+  fields["result"].set_string_value(allowed ? "allowed" : "denied");
+  info.setDynamicMetadata(NetworkFilterNames::get().PostgresProxy, decision);
+  if (!allowed) {
+    rejectStartup();
+    return false;
+  }
+  config_->stats_.authorization_allowed_.inc();
+  return true;
+}
+
+void PostgresFilter::rejectStartup() {
+  if (authorization_denied_) {
+    return;
+  }
+  authorization_denied_ = true;
+  config_->stats_.authorization_denied_.inc();
+  read_callbacks_->connection().streamInfo().setConnectionTerminationDetails(
+      "postgres_rbac_denied");
+  auto response =
+      encoder_->buildErrorResponse("FATAL", "connection denied by Envoy proxy", "28000");
+  write_callbacks_->injectWriteDataToFilterChain(response, false);
+  read_callbacks_->connection().close(Network::ConnectionCloseType::FlushWrite);
 }
 
 void PostgresFilter::verifyDownstreamSSL() {
